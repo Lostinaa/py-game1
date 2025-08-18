@@ -199,56 +199,85 @@ class DialogueSystem:
 
     async def initialize_realtime(self):
         print("[DialogueSystem] Attempting Realtime API connection...")
+        backoff_seconds = 1
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with self.client.beta.realtime.connect(model="gpt-4o-realtime-preview-2024-10-01") as conn:
+                    self.realtime_conn = conn
+                    print("[DialogueSystem] Realtime API connected successfully!")
+                    
+                    # Configure session for better audio handling; voice will be set per-conversation/per-turn
+                    await conn.session.update(session={
+                        "turn_detection": {"type": "server_vad"},
+                        "response_format": {"type": "audio"},
+                    })
+
+                    async for event in conn:
+                        if event.type == "session.created":
+                            print(f"[Realtime] Session created: {event.session.id}")
+
+                        elif event.type == "session.updated":
+                            print(f"[Realtime] Session updated: {event.session}")
+
+                        elif event.type == "response.audio.delta":
+                            if event.item_id != self.last_audio_item_id:
+                                self.audio_player.reset_frame_count()
+                                self.last_audio_item_id = event.item_id
+                            bytes_data = base64.b64decode(event.delta)
+                            self.audio_player.add_data(bytes_data)
+
+                        elif event.type == "response.audio_transcript.delta":
+                            so_far = self.acc_items.get(event.item_id, "")
+                            so_far += event.delta
+                            self.acc_items[event.item_id] = so_far
+                            print(f"[Realtime] Assistant partial transcript: {so_far}")
+
+                        elif event.type == "response.audio_transcript.complete":
+                            final_transcript = event.transcript
+                            print(f"[Realtime] Assistant final transcript: {final_transcript}")
+                            self.npc_message = final_transcript
+                            # Add to conversation history
+                            if self.conversation_history:
+                                self.conversation_history.append({
+                                    "role": "assistant",
+                                    "content": final_transcript
+                                })
+                # If we exit the async with normally, break retry loop
+                break
+            except Exception as e:
+                print(f"[DialogueSystem] Realtime connection error (attempt {attempt}/{max_attempts}): {e}")
+                if attempt == max_attempts:
+                    import traceback
+                    traceback.print_exc()
+                    print("[DialogueSystem] Giving up on Realtime connection for now. Text mode will still work.")
+                    self.realtime_conn = None
+                    break
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds = min(backoff_seconds * 2, 16)
+
+    async def recreate_realtime_for_current_npc(self):
+        """Close any existing realtime connection and start a new one configured for the current NPC."""
         try:
-            async with self.client.beta.realtime.connect(model="gpt-4o-realtime-preview-2024-10-01") as conn:
-                self.realtime_conn = conn
-                print("[DialogueSystem] Realtime API connected successfully!")
-                
-                # Configure session for better audio handling with default voice
-                await conn.session.update(session={
-                    "turn_detection": {"type": "server_vad"},
-                    "response_format": {"type": "audio"},
-                    "voice": "alloy"  # Default voice (can be changed per NPC)
-                })
+            if self.realtime_conn:
+                try:
+                    await self.realtime_conn.close()
+                except Exception:
+                    # Fallback: attempt attribute-based close
+                    try:
+                        await getattr(self.realtime_conn, "disconnect")()
+                    except Exception:
+                        pass
+                self.realtime_conn = None
+                await asyncio.sleep(0.05)
+        except Exception:
+            pass
+        # Start a fresh listener task
+        asyncio.create_task(self.initialize_realtime())
 
-                async for event in conn:
-                    if event.type == "session.created":
-                        print(f"[Realtime] Session created: {event.session.id}")
-
-                    elif event.type == "session.updated":
-                        print(f"[Realtime] Session updated: {event.session}")
-
-                    elif event.type == "response.audio.delta":
-                        if event.item_id != self.last_audio_item_id:
-                            self.audio_player.reset_frame_count()
-                            self.last_audio_item_id = event.item_id
-                        bytes_data = base64.b64decode(event.delta)
-                        self.audio_player.add_data(bytes_data)
-
-                    elif event.type == "response.audio_transcript.delta":
-                        so_far = self.acc_items.get(event.item_id, "")
-                        so_far += event.delta
-                        self.acc_items[event.item_id] = so_far
-                        print(f"[Realtime] Assistant partial transcript: {so_far}")
-
-                    elif event.type == "response.audio_transcript.complete":
-                        final_transcript = event.transcript
-                        print(f"[Realtime] Assistant final transcript: {final_transcript}")
-                        self.npc_message = final_transcript
-                        # Add to conversation history
-                        if self.conversation_history:
-                            self.conversation_history.append({
-                                "role": "assistant",
-                                "content": final_transcript
-                            })
-
-        except Exception as e:
-            print(f"[DialogueSystem] Realtime connection error: {e}")
-            import traceback
-            traceback.print_exc()
-
-    async def update_voice_settings(self, npc_role):
-        """Update voice settings based on the NPC being talked to"""
+    async def update_voice_settings(self, npc_role, override_voice: str | None = None):
+        """Update voice settings based on the NPC being talked to.
+        If override_voice is provided, persist and use it for this role (not used in auto mode)."""
         if not self.realtime_conn:
             return
             
@@ -261,20 +290,20 @@ class DialogueSystem:
             # - "nova": Female voice, clear and professional
             # - "shimmer": Female voice, warm and engaging
             
-            # Voice settings for different NPCs
-            voice_settings = {
-                "HR": {
-                    "voice": "nova",  # Female voice for Sarah (HR) - clear and professional
-                    "speed": 1.0
-                },
-                "CEO": {
-                    "voice": "echo",  # Male voice for Michael (CEO) - warm and authoritative
-                    "speed": 0.9  # Slightly slower for more authoritative tone
-                }
-            }
-            
-            if npc_role in voice_settings:
-                settings = voice_settings[npc_role]
+            # In automatic mode, ignore manual overrides
+            self.voice_override = {}
+
+            # Get settings centrally to avoid mismatches
+            settings = None
+            if npc_role:
+                prev_current = self.current_npc
+                # Temporarily set to lookup role without affecting state
+                try:
+                    self.current_npc = npc_role
+                    settings = self.get_voice_settings_for_current_npc()
+                finally:
+                    self.current_npc = prev_current
+            if settings:
                 await self.realtime_conn.session.update(session={
                     "voice": settings["voice"],
                     "speed": settings["speed"]
@@ -283,6 +312,16 @@ class DialogueSystem:
                 
         except Exception as e:
             print(f"[DialogueSystem] Error updating voice settings: {e}")
+
+    def get_voice_settings_for_current_npc(self):
+        """Return a small dict with voice and speed for the current NPC."""
+        voice_settings = {
+            # Sarah (HR): distinctly female
+            "HR": {"voice": "nova", "speed": 1.0},
+            # Michael (CEO): distinctly male (deeper)
+            "CEO": {"voice": "onyx", "speed": 0.85},
+        }
+        return voice_settings.get(self.current_npc)
 
     async def switch_voice_manually(self, voice_name, speed=1.0):
         """Manually switch to a different voice (useful for testing or dynamic changes)"""
@@ -326,6 +365,8 @@ class DialogueSystem:
             self.audio_stream.start()
             self.is_recording = True
             print("[DialogueSystem] Audio recording started")
+            # Reset audio item tracking when a new recording starts
+            self.last_audio_item_id = None
             
             # Start audio processing in background
             asyncio.run_coroutine_threadsafe(self.process_audio_input(), self.loop)
@@ -382,12 +423,31 @@ class DialogueSystem:
             return
             
         try:
+            # Ensure the correct NPC voice is applied per turn before creating a response
+            settings = self.get_voice_settings_for_current_npc()
+            if settings:
+                try:
+                    await self.realtime_conn.session.update(session={
+                        "voice": settings["voice"],
+                        "speed": settings["speed"],
+                    })
+                    print(f"[DialogueSystem] (Turn) Voice set to {settings['voice']} for {self.current_npc}")
+                except Exception as e:
+                    print(f"[DialogueSystem] Warning: Could not update voice this turn: {e}")
+
             # Commit the audio buffer
             await self.realtime_conn.input_audio_buffer.commit()
             print("[DialogueSystem] Audio buffer committed")
             
             # Request assistant response
-            await self.realtime_conn.response.create()
+            # Also pass voice override in the response request to guarantee immediate effect
+            if settings:
+                await self.realtime_conn.response.create(response={
+                    "modalities": ["audio", "text"],
+                    "audio": {"voice": settings["voice"]},
+                })
+            else:
+                await self.realtime_conn.response.create()
             print("[DialogueSystem] Requested assistant response")
             
         except Exception as e:
@@ -444,7 +504,23 @@ class DialogueSystem:
         self.initial_player_pos = [player_pos[0], player_pos[1], player_pos[2]] if player_pos else [0, 0.5, 0]
         print(f"[DialogueSystem] Dialogue started with {npc_role}")
 
-        # Update voice settings for the current NPC
+        # Cancel any in-flight response and flush audio so the next turn starts cleanly
+        try:
+            if self.realtime_conn:
+                asyncio.run_coroutine_threadsafe(self.realtime_conn.response.cancel(), self.loop)
+        except Exception:
+            pass
+        if self.audio_player:
+            try:
+                self.audio_player.stop()
+                self.audio_player.reset_frame_count()
+            except Exception:
+                pass
+        # Reset transcript/item tracking
+        self.acc_items = {}
+        self.last_audio_item_id = None
+
+        # Update session voice now for this NPC (no reconnect to avoid race conditions)
         asyncio.run_coroutine_threadsafe(self.update_voice_settings(npc_role), self.loop)
 
         # Base personality framework for consistent behavior
@@ -581,6 +657,18 @@ class DialogueSystem:
             keys = pygame.key.get_pressed()
             # SHIFT+Q ends chat
             if keys[pygame.K_LSHIFT] and event.key == pygame.K_q:
+                # Hard-interrupt any in-flight response and flush audio so voice switches immediately next turn
+                try:
+                    if self.realtime_conn:
+                        asyncio.run_coroutine_threadsafe(self.realtime_conn.response.cancel(), self.loop)
+                except Exception as _e:
+                    pass
+                try:
+                    if self.audio_player:
+                        self.audio_player.stop()
+                        self.audio_player.reset_frame_count()
+                except Exception:
+                    pass
                 self.active = False
                 self.input_active = False
                 print("[DialogueSystem] Chat ended")
@@ -588,15 +676,30 @@ class DialogueSystem:
 
             # If user wants to push-to-talk with "F5"
             if event.key == pygame.K_F5:
+                # Force-set voice for the active NPC right before toggling
+                try:
+                    if self.current_npc:
+                        asyncio.run_coroutine_threadsafe(self.update_voice_settings(self.current_npc), self.loop)
+                except Exception:
+                    pass
                 # Toggle audio recording
                 if self.is_recording:
                     # Stop recording and send to API
                     self.stop_audio_recording()
                     print("[DialogueSystem] Stopped recording & requested assistant response.")
                 else:
+                    # Flush any old audio
+                    if self.audio_player:
+                        try:
+                            self.audio_player.stop()
+                            self.audio_player.reset_frame_count()
+                        except Exception:
+                            pass
                     # Start recording
                     self.start_audio_recording()
                     print("[DialogueSystem] Started recording user speech.")
+
+            # F8 disabled: auto voice selection per role enforced every turn
             
             # Check audio system status with F6
             if event.key == pygame.K_F6:
